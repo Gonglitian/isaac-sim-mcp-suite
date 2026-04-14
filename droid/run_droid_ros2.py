@@ -81,6 +81,7 @@ def setup_ros2_graph(env):
                 ("CamExt1", "isaacsim.ros2.bridge.ROS2CameraHelper"),
                 ("CamExt2", "isaacsim.ros2.bridge.ROS2CameraHelper"),
                 ("CamWrist", "isaacsim.ros2.bridge.ROS2CameraHelper"),
+                ("CamWristDepth", "isaacsim.ros2.bridge.ROS2CameraHelper"),
             ],
             og.Controller.Keys.CONNECT: [
                 ("OnTick.outputs:tick", "PublishJointState.inputs:execIn"),
@@ -91,6 +92,7 @@ def setup_ros2_graph(env):
                 ("OnTick.outputs:tick", "CamExt1.inputs:execIn"),
                 ("OnTick.outputs:tick", "CamExt2.inputs:execIn"),
                 ("OnTick.outputs:tick", "CamWrist.inputs:execIn"),
+                ("OnTick.outputs:tick", "CamWristDepth.inputs:execIn"),
                 ("Context.outputs:context", "PublishJointState.inputs:context"),
                 ("Context.outputs:context", "SubscribeJointState.inputs:context"),
                 ("Context.outputs:context", "PublishClock.inputs:context"),
@@ -98,6 +100,7 @@ def setup_ros2_graph(env):
                 ("Context.outputs:context", "CamExt1.inputs:context"),
                 ("Context.outputs:context", "CamExt2.inputs:context"),
                 ("Context.outputs:context", "CamWrist.inputs:context"),
+                ("Context.outputs:context", "CamWristDepth.inputs:context"),
                 ("ReadSimTime.outputs:simulationTime", "PublishJointState.inputs:timeStamp"),
                 ("ReadSimTime.outputs:simulationTime", "PublishClock.inputs:timeStamp"),
                 ("SubscribeJointState.outputs:jointNames", "ArticulationController.inputs:jointNames"),
@@ -153,6 +156,30 @@ def setup_ros2_graph(env):
             print(f"  Camera ROS2 publisher: {topic_map[node_name]} from {cam_path}")
         except Exception as e:
             print(f"  Warning: Failed to setup {node_name}: {e}")
+
+    # ── Wrist depth camera (for GraspGen point cloud) ──
+    wrist_cam_path = "/World/envs/env_0/robot/Gripper/Robotiq_2F_85/base_link/wrist_cam"
+    try:
+        rp_depth = rep.create.render_product(wrist_cam_path, resolution=(320, 240))
+        og.Controller.set(
+            og.Controller.attribute("/World/ROS2_Graph/CamWristDepth.inputs:renderProductPath"),
+            str(rp_depth.path),
+        )
+        og.Controller.set(
+            og.Controller.attribute("/World/ROS2_Graph/CamWristDepth.inputs:topicName"),
+            "cam_wrist/depth",
+        )
+        og.Controller.set(
+            og.Controller.attribute("/World/ROS2_Graph/CamWristDepth.inputs:type"),
+            "depth",
+        )
+        og.Controller.set(
+            og.Controller.attribute("/World/ROS2_Graph/CamWristDepth.inputs:frameId"),
+            "cam_wrist",
+        )
+        print("  Depth camera: cam_wrist/depth")
+    except Exception as e:
+        print(f"  Warning: Depth camera setup failed: {e}")
 
     print("ROS2 OmniGraph created (OnTick auto-fires every render)")
 
