@@ -140,6 +140,7 @@ def gripper_pos(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityC
 # ---------------------------------------------------------------------------
 @configclass
 class ActionCfg:
+    """IK-relative action space (for keyboard teleop)."""
     arm = mdp.DifferentialInverseKinematicsActionCfg(
         asset_name="robot",
         joint_names=["panda_joint.*"],
@@ -151,6 +152,23 @@ class ActionCfg:
             ik_params={"lambda_val": 0.05},
         ),
         scale=1.0,
+    )
+    gripper = BinaryGripperActionCfg(
+        asset_name="robot",
+        joint_names=["finger_joint"],
+        open_command_expr={"finger_joint": 0.0},
+        close_command_expr={"finger_joint": np.pi / 4},
+    )
+
+
+@configclass
+class JointPosActionCfg:
+    """Joint position action space (for auto pipeline / scripted control)."""
+    arm = mdp.JointPositionActionCfg(
+        asset_name="robot",
+        joint_names=["panda_joint.*"],
+        preserve_order=True,
+        use_default_offset=False,
     )
     gripper = BinaryGripperActionCfg(
         asset_name="robot",
@@ -211,3 +229,9 @@ class DroidEnvCfg(ManagerBasedRLEnvCfg):
 
     def set_scene(self, scene_id: str = "1"):
         self.scene.load_scene(scene_id)
+
+
+@configclass
+class DroidEnvJointPosCfg(DroidEnvCfg):
+    """DROID env with JointPosition action space (for scripted/auto pipelines)."""
+    actions = JointPosActionCfg()
