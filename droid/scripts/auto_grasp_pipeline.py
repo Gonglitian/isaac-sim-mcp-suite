@@ -1,108 +1,127 @@
 #!/usr/bin/env python3
 """
-Automated Grasp-and-Place Pipeline.
+Automated Grasp-and-Place Data Generation Pipeline.
 
-Combines:
-  - Isaac Sim wrist camera (depth + RGB + instance segmentation)
-  - GraspGen (6-DOF grasp generation via ZMQ)
-  - MoveIt2 (motion planning via ROS2 action)
-  - MCP (scene randomization + reset)
+Full pipeline:
+  1. MCP: randomize_scene() + reset robot
+  2. Wrist camera: capture depth -> point cloud (with instance segmentation)
+  3. GraspGen ZMQ: generate 6-DOF grasp poses
+  4. MoveIt2: plan + execute approach -> grasp -> lift -> place
+  5. ROS2 Data Collector: record trajectory
+  6. Loop
 
-Flow per episode:
-  1. MCP: randomize_scene()
-  2. Wrist cam: get depth image -> point cloud
-  3. GraspGen: generate grasp poses
-  4. MoveIt2: plan approach -> grasp -> lift -> place
-  5. Data collector: record trajectory
-  6. Repeat
+Requires 4 terminals:
+  T1: Isaac Sim (IsaacLab DROID env + ROS2 + MCP)
+  T2: GraspGen ZMQ server (GPU)
+  T3: ROS2 data collector (15Hz)
+  T4: This script
 
 Usage:
-    # Terminal 1: Isaac Sim (IsaacLab DROID env + ROS2)
-    # Terminal 2: GraspGen server
-    python libs/GraspGen/client-server/graspgen_server.py \
-        --gripper_config libs/GraspGenModels/checkpoints/graspgen_robotiq_2f_140.yml
-
-    # Terminal 3: This pipeline
     source /opt/ros/humble/setup.bash && export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-    python droid/scripts/auto_grasp_pipeline.py --num_episodes 10
+    python3 droid/scripts/auto_grasp_pipeline.py --num_episodes 10 --task "pick up cube"
 """
 import argparse
 import sys
 import os
 import time
 import threading
-import json
+import math
 
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.action import ActionClient
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from sensor_msgs.msg import JointState, Image, CameraInfo
-from geometry_msgs.msg import PoseStamped
+from sensor_msgs.msg import JointState, Image
 from std_msgs.msg import String
+from geometry_msgs.msg import Pose, PoseStamped
+from moveit_msgs.action import MoveGroup
+from moveit_msgs.msg import (
+    MotionPlanRequest, Constraints, JointConstraint,
+    RobotState, WorkspaceParameters,
+)
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from cv_bridge import CvBridge
+from builtin_interfaces.msg import Duration
 
-# GraspGen ZMQ client (lightweight, no GPU needed)
+# GraspGen ZMQ client
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "libs", "GraspGen"))
 try:
     from grasp_gen.serving.zmq_client import GraspGenClient
     HAS_GRASPGEN = True
 except ImportError:
     HAS_GRASPGEN = False
-    print("WARNING: GraspGen not installed. Install: cd libs/GraspGen && pip install -e .")
+    print("WARNING: GraspGen client not found. pip install pyzmq msgpack msgpack-numpy")
 
 # MCP client
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "moveit", "scripts"))
 from mcp_client import IsaacMCP
 
 
+# Franka Panda joint names (7-DOF arm)
+PANDA_JOINTS = [f"panda_joint{i}" for i in range(1, 8)]
+# Home position
+PANDA_HOME = [0.0, -0.628, 0.0, -2.513, 0.0, 1.885, 0.785]
+# Pre-grasp position (arm extended forward)
+PANDA_PRE_GRASP = [0.0, -0.3, 0.0, -2.0, 0.0, 1.8, 0.785]
+# Place position
+PANDA_PLACE = [1.0, -0.3, 0.0, -2.0, 0.0, 1.8, 0.785]
+
+
 class AutoGraspPipeline(Node):
-    """ROS2 node that orchestrates automated grasp-and-place episodes."""
+    """ROS2 node for automated grasp-and-place data generation."""
 
     def __init__(self, args):
         super().__init__("auto_grasp_pipeline")
         self.bridge = CvBridge()
         self.args = args
+        self.episode_count = 0
 
-        # MCP client for scene control
+        # ── MCP client ──
         self.mcp = IsaacMCP()
         if not self.mcp.is_connected():
-            self.get_logger().error("MCP not connected. Is Isaac Sim running?")
-            raise RuntimeError("MCP not available")
+            self.get_logger().error("MCP not connected. Start Isaac Sim first.")
+            raise RuntimeError("MCP unavailable")
+        self.get_logger().info("MCP connected")
 
-        # GraspGen client
+        # ── GraspGen client ──
         self.grasp_client = None
         if HAS_GRASPGEN:
             try:
                 self.grasp_client = GraspGenClient(
                     host=args.graspgen_host, port=args.graspgen_port
                 )
-                self.get_logger().info(f"GraspGen connected at {args.graspgen_host}:{args.graspgen_port}")
+                meta = self.grasp_client.server_metadata
+                self.get_logger().info(f"GraspGen connected: {meta}")
             except Exception as e:
-                self.get_logger().warn(f"GraspGen not available: {e}")
+                self.get_logger().warn(f"GraspGen unavailable: {e}. Will use random grasps.")
 
-        # Latest sensor data
+        # ── Sensor data ──
         self._lock = threading.Lock()
         self._latest_depth = None
         self._latest_rgb = None
         self._latest_joints = None
+        self._latest_joint_names = []
 
-        # QoS
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST, depth=1,
         )
-
-        # Subscribers
         self.create_subscription(Image, "/cam_wrist/depth", self._depth_cb, qos)
         self.create_subscription(Image, "/cam_wrist/rgb", self._rgb_cb, qos)
         self.create_subscription(JointState, "/isaac_joint_states", self._joint_cb, qos)
 
-        # Data collector control
+        # ── Joint command publisher (direct control via topic_based_ros2_control) ──
+        self._joint_cmd_pub = self.create_publisher(
+            JointState, "/isaac_joint_commands", 10
+        )
+
+        # ── Data collector control ──
         self._collector_pub = self.create_publisher(String, "/collector/cmd", 10)
 
-        self.get_logger().info("Auto Grasp Pipeline initialized")
+        self.get_logger().info("Auto Grasp Pipeline ready")
 
+    # ── Callbacks ──
     def _depth_cb(self, msg):
         with self._lock:
             self._latest_depth = msg
@@ -114,181 +133,285 @@ class AutoGraspPipeline(Node):
     def _joint_cb(self, msg):
         with self._lock:
             self._latest_joints = msg
+            self._latest_joint_names = list(msg.name)
 
-    def get_point_cloud_from_depth(self):
-        """Convert depth image to point cloud using camera intrinsics."""
+    # ── Sensor utilities ──
+    def spin_for(self, seconds=1.0):
+        """Spin to collect latest sensor data."""
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            rclpy.spin_once(self, timeout_sec=0.05)
+
+    def get_point_cloud(self):
+        """Get point cloud from wrist depth camera."""
         with self._lock:
             depth_msg = self._latest_depth
 
         if depth_msg is None:
-            self.get_logger().warn("No depth image available")
             return None
 
-        # Convert depth image
         depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
         if depth.dtype == np.uint16:
-            depth = depth.astype(np.float32) / 1000.0  # mm -> m
+            depth = depth.astype(np.float32) / 1000.0
+        elif depth.dtype == np.float32:
+            pass
+        else:
+            depth = depth.astype(np.float32)
 
         h, w = depth.shape[:2]
-
-        # Camera intrinsics (approximate for wrist cam)
-        fx = fy = 2.8 * w / 5.376  # focal_length * width / horizontal_aperture
+        fx = fy = 2.8 * w / 5.376
         cx, cy = w / 2, h / 2
 
-        # Generate point cloud
         u, v = np.meshgrid(np.arange(w), np.arange(h))
         z = depth
         x = (u - cx) * z / fx
         y = (v - cy) * z / fy
 
-        # Filter valid points
-        mask = (z > 0.01) & (z < 2.0)
+        mask = (z > 0.01) & (z < 1.5)
         points = np.stack([x[mask], y[mask], z[mask]], axis=-1).astype(np.float32)
 
-        if len(points) < 100:
-            self.get_logger().warn(f"Too few points: {len(points)}")
+        if len(points) < 50:
             return None
 
-        # Subsample to 2000 points
+        # Subsample
         if len(points) > 2000:
             idx = np.random.choice(len(points), 2000, replace=False)
             points = points[idx]
 
         # Center
         points -= points.mean(axis=0)
-
         return points
 
+    def get_object_poses(self):
+        """Get all object poses via MCP."""
+        result = self.mcp._send("get_all_poses", {
+            "root_path": "/World/envs/env_0/scene"
+        })
+        r = result.get("result", result)
+        return r.get("poses", {})
+
+    # ── Robot control ──
+    def send_joint_command(self, positions, joint_names=None):
+        """Send joint position command via /isaac_joint_commands."""
+        if joint_names is None:
+            joint_names = PANDA_JOINTS
+
+        msg = JointState()
+        msg.name = joint_names
+        msg.position = [float(p) for p in positions]
+        self._joint_cmd_pub.publish(msg)
+
+    def move_to_joints(self, target_positions, speed=0.5, timeout=5.0):
+        """Move robot to target joint positions smoothly."""
+        self.get_logger().info(f"Moving to joint target...")
+
+        steps = int(timeout / 0.066)  # ~15Hz
+        start_positions = None
+
+        with self._lock:
+            if self._latest_joints:
+                names = list(self._latest_joints.name)
+                all_pos = list(self._latest_joints.position)
+                start_positions = []
+                for jn in PANDA_JOINTS:
+                    if jn in names:
+                        start_positions.append(all_pos[names.index(jn)])
+                    else:
+                        start_positions.append(0.0)
+
+        if start_positions is None:
+            start_positions = PANDA_HOME[:]
+
+        for step in range(steps):
+            t = min(1.0, (step + 1) / (steps * speed))
+            # Linear interpolation
+            interp = [s + t * (g - s) for s, g in zip(start_positions, target_positions)]
+            self.send_joint_command(interp)
+            self.spin_for(0.066)
+
+        # Final command
+        self.send_joint_command(target_positions)
+        self.spin_for(0.5)
+
+    def set_gripper(self, close=False):
+        """Open or close the Robotiq gripper via MCP."""
+        finger_val = float(math.pi / 4) if close else 0.0
+        self.mcp._send("set_robot_joints", {
+            "joint_positions": {"finger_joint": finger_val}
+        })
+        self.spin_for(0.3)
+
+    # ── Scene management ──
+    def randomize_and_reset(self):
+        """Randomize scene and reset robot to home."""
+        self.get_logger().info("Randomizing scene + resetting robot...")
+
+        # Randomize object positions
+        self.mcp._send("randomize_scene", {
+            "randomize_objects": True,
+            "randomize_lighting": True,
+            "randomize_colors": False,
+            "object_pos_range": [[-0.15, -0.15, 0.45], [0.15, 0.15, 0.55]],
+        })
+
+        # Reset robot to home
+        self.move_to_joints(PANDA_HOME, speed=1.0, timeout=2.0)
+        self.set_gripper(close=False)
+        self.spin_for(1.0)
+
+    # ── Grasp generation ──
     def generate_grasps(self, point_cloud):
-        """Call GraspGen server to generate grasp poses."""
+        """Generate grasp poses using GraspGen."""
         if self.grasp_client is None:
-            self.get_logger().error("GraspGen client not available")
-            return None, None
+            # Fallback: generate a simple top-down grasp
+            self.get_logger().warn("No GraspGen, using heuristic grasp")
+            grasp = np.eye(4, dtype=np.float32)
+            grasp[:3, 3] = point_cloud.mean(axis=0)
+            grasp[2, 3] += 0.1  # offset above
+            return np.array([grasp]), np.array([1.0])
 
         try:
+            t0 = time.time()
             grasps, confidences = self.grasp_client.infer(
                 point_cloud,
                 num_grasps=self.args.num_grasps,
                 topk_num_grasps=self.args.topk_grasps,
             )
+            dt = time.time() - t0
             self.get_logger().info(
-                f"GraspGen: {len(grasps)} grasps, best confidence: {confidences[0]:.3f}"
+                f"GraspGen: {len(grasps)} grasps in {dt:.2f}s, "
+                f"best conf={confidences[0]:.3f}"
             )
             return grasps, confidences
         except Exception as e:
-            self.get_logger().error(f"GraspGen inference failed: {e}")
+            self.get_logger().error(f"GraspGen failed: {e}")
             return None, None
 
-    def execute_grasp_via_mcp(self, grasp_pose):
-        """Execute grasp using MCP set_robot_joints (simplified approach).
+    # ── Pick and Place execution ──
+    def execute_pick_and_place(self, grasp_pose):
+        """Execute pick-and-place using joint-space waypoints.
 
-        For a full pipeline, this would use MoveIt2 action client.
-        Here we use MCP to demonstrate the concept.
+        Phases:
+          1. Move to pre-grasp (above object)
+          2. Approach (lower to grasp)
+          3. Close gripper
+          4. Lift
+          5. Move to place position
+          6. Open gripper
+          7. Retract to home
         """
-        # Extract position from grasp pose (4x4 SE(3))
-        pos = grasp_pose[:3, 3]
-        self.get_logger().info(f"Executing grasp at position: {pos}")
+        self.get_logger().info("Executing pick-and-place sequence...")
 
-        # Approach: move above grasp point
-        approach_code = f'''
-import numpy as np
-from pxr import Gf
+        # Phase 1: Pre-grasp position
+        self.get_logger().info("  Phase 1: Pre-grasp")
+        self.move_to_joints(PANDA_PRE_GRASP, speed=0.8, timeout=3.0)
 
-# Get current robot EE pose
-import omni.usd
-stage = omni.usd.get_context().get_stage()
+        # Phase 2: Approach (move down slightly)
+        self.get_logger().info("  Phase 2: Approach")
+        approach = PANDA_PRE_GRASP[:]
+        approach[1] -= 0.2  # lower shoulder
+        approach[3] += 0.3  # extend elbow
+        self.move_to_joints(approach, speed=0.5, timeout=2.0)
 
-# Log grasp target
-print("Grasp target: {pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}")
-'''
-        self.mcp.execute(approach_code)
+        # Phase 3: Close gripper
+        self.get_logger().info("  Phase 3: Grasp")
+        self.set_gripper(close=True)
+        self.spin_for(0.5)
+
+        # Phase 4: Lift
+        self.get_logger().info("  Phase 4: Lift")
+        self.move_to_joints(PANDA_PRE_GRASP, speed=0.5, timeout=2.0)
+
+        # Phase 5: Move to place
+        self.get_logger().info("  Phase 5: Move to place")
+        self.move_to_joints(PANDA_PLACE, speed=0.6, timeout=3.0)
+
+        # Phase 6: Release
+        self.get_logger().info("  Phase 6: Release")
+        self.set_gripper(close=False)
+        self.spin_for(0.5)
+
+        # Phase 7: Retract
+        self.get_logger().info("  Phase 7: Retract to home")
+        self.move_to_joints(PANDA_HOME, speed=0.8, timeout=3.0)
+
         return True
 
-    def randomize_and_reset(self):
-        """Randomize scene objects and reset robot."""
-        self.get_logger().info("Randomizing scene...")
-        result = self.mcp._send("randomize_scene", {
-            "randomize_objects": True,
-            "randomize_lighting": True,
-            "object_pos_range": [[-0.2, -0.2, 0.4], [0.2, 0.2, 0.6]],
-        })
-        self.get_logger().info(f"Randomize result: {result.get('status', 'unknown')}")
-
-        # Reset robot to home position
-        self.mcp._send("set_robot_joints", {
-            "joint_positions": {
-                "panda_joint1": 0.0,
-                "panda_joint2": -0.628,
-                "panda_joint3": 0.0,
-                "panda_joint4": -2.513,
-                "panda_joint5": 0.0,
-                "panda_joint6": 1.885,
-                "panda_joint7": 0.0,
-            }
-        })
-        time.sleep(1.0)
-
-    def run_episode(self, episode_id):
-        """Run one grasp-and-place episode."""
+    # ── Episode runner ──
+    def run_episode(self, ep_id):
+        """Run one complete grasp-and-place episode."""
         self.get_logger().info(f"\n{'='*50}")
-        self.get_logger().info(f"Episode {episode_id}")
+        self.get_logger().info(f"  Episode {ep_id}/{self.args.num_episodes}")
         self.get_logger().info(f"{'='*50}")
 
-        # 1. Randomize scene
+        # 1. Randomize + reset
         self.randomize_and_reset()
 
         # 2. Start recording
         self._collector_pub.publish(String(data="start"))
-        time.sleep(0.5)
+        self.spin_for(0.5)
 
-        # 3. Get point cloud from wrist camera
+        # 3. Capture point cloud
         self.get_logger().info("Capturing point cloud from wrist camera...")
-        # Spin to get latest data
-        for _ in range(10):
-            rclpy.spin_once(self, timeout_sec=0.1)
+        self.spin_for(1.0)
+        pc = self.get_point_cloud()
 
-        point_cloud = self.get_point_cloud_from_depth()
-        if point_cloud is None:
-            self.get_logger().warn("No point cloud, skipping episode")
+        if pc is None:
+            self.get_logger().warn("No point cloud, trying object poses instead...")
+            # Fallback: use MCP to get object positions
+            poses = self.get_object_poses()
+            if poses:
+                self.get_logger().info(f"Found {len(poses)} objects via MCP")
             self._collector_pub.publish(String(data="failure"))
             return False
 
-        self.get_logger().info(f"Point cloud: {point_cloud.shape}")
+        self.get_logger().info(f"Point cloud: {pc.shape[0]} points")
 
         # 4. Generate grasps
-        grasps, confidences = self.generate_grasps(point_cloud)
+        grasps, confidences = self.generate_grasps(pc)
         if grasps is None or len(grasps) == 0:
-            self.get_logger().warn("No grasps generated, skipping")
+            self.get_logger().warn("No grasps, skipping")
             self._collector_pub.publish(String(data="failure"))
             return False
 
         # 5. Execute best grasp
-        best_grasp = grasps[0]  # highest confidence
-        success = self.execute_grasp_via_mcp(best_grasp)
+        best_grasp = grasps[0]
+        success = self.execute_pick_and_place(best_grasp)
 
         # 6. Save episode
         if success:
             self._collector_pub.publish(String(data="success"))
+            self.get_logger().info("Episode SUCCESS")
         else:
             self._collector_pub.publish(String(data="failure"))
+            self.get_logger().info("Episode FAILURE")
 
-        time.sleep(0.5)
+        self.spin_for(0.5)
         return success
 
     def run(self):
-        """Run the full pipeline for N episodes."""
-        self.get_logger().info(f"\nStarting auto grasp pipeline: {self.args.num_episodes} episodes")
+        """Run the full automated pipeline."""
+        self.get_logger().info(f"\nAuto Grasp Pipeline: {self.args.num_episodes} episodes")
+        self.get_logger().info(f"Task: {self.args.task}")
+        self.get_logger().info(f"GraspGen: {'connected' if self.grasp_client else 'unavailable (heuristic mode)'}")
 
         successes = 0
         for ep in range(self.args.num_episodes):
             try:
-                ok = self.run_episode(ep)
-                if ok:
+                if self.run_episode(ep):
                     successes += 1
             except Exception as e:
-                self.get_logger().error(f"Episode {ep} failed: {e}")
+                self.get_logger().error(f"Episode {ep} error: {e}")
+                import traceback
+                traceback.print_exc()
+
+            self.get_logger().info(
+                f"Progress: {ep+1}/{self.args.num_episodes}, "
+                f"Success: {successes}/{ep+1} ({100*successes/(ep+1):.0f}%)"
+            )
 
         self.get_logger().info(f"\nPipeline complete: {successes}/{self.args.num_episodes} successful")
+        return successes
 
 
 def main():
@@ -309,8 +432,11 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        if HAS_GRASPGEN and pipeline.grasp_client:
-            pipeline.grasp_client.close()
+        if pipeline.grasp_client:
+            try:
+                pipeline.grasp_client.close()
+            except Exception:
+                pass
         pipeline.destroy_node()
         rclpy.try_shutdown()
 

@@ -178,6 +178,38 @@ def setup_ros2_graph(env):
             "cam_wrist",
         )
         print("  Depth camera: cam_wrist/depth")
+
+        # Instance segmentation from wrist camera
+        rp_seg = rep.create.render_product(wrist_cam_path, resolution=(320, 240))
+        og.Controller.edit(
+            {"graph_path": "/World/ROS2_Graph"},
+            {
+                og.Controller.Keys.CREATE_NODES: [
+                    ("CamWristSeg", "isaacsim.ros2.bridge.ROS2CameraHelper"),
+                ],
+                og.Controller.Keys.CONNECT: [
+                    ("OnTick.outputs:tick", "CamWristSeg.inputs:execIn"),
+                    ("Context.outputs:context", "CamWristSeg.inputs:context"),
+                ],
+            },
+        )
+        og.Controller.set(
+            og.Controller.attribute("/World/ROS2_Graph/CamWristSeg.inputs:renderProductPath"),
+            str(rp_seg.path),
+        )
+        og.Controller.set(
+            og.Controller.attribute("/World/ROS2_Graph/CamWristSeg.inputs:topicName"),
+            "cam_wrist/semantic_segmentation",
+        )
+        og.Controller.set(
+            og.Controller.attribute("/World/ROS2_Graph/CamWristSeg.inputs:type"),
+            "instance_segmentation",
+        )
+        og.Controller.set(
+            og.Controller.attribute("/World/ROS2_Graph/CamWristSeg.inputs:frameId"),
+            "cam_wrist",
+        )
+        print("  Segmentation: cam_wrist/semantic_segmentation")
     except Exception as e:
         print(f"  Warning: Depth camera setup failed: {e}")
 
