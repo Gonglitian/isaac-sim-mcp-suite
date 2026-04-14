@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.venv/
+*.so
+
+# Isaac Sim / USD assets (large binary files)
+droid_sim/assets/*.usd
+droid_sim/assets/*.hdr
+droid_sim/assets/backgrounds/
+droid_sim/sim-evals/
+
+# Recorded data (large, per-user)
+droid_data/
+*.h5
+
+# Logs
+*.log
+_build/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ROS2 build artifacts
+log/
+install/
+
+# HuggingFace cache
+.cache/
+
+# Temporary files
+/tmp/
+*.tmp
