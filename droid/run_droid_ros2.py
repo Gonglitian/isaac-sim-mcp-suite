@@ -223,6 +223,11 @@ def main():
     env_cfg.terminations.time_out = None
     env = ManagerBasedRLEnv(cfg=env_cfg)
 
+    # Store env in builtins for MCP execute_script access
+    import builtins
+    builtins._isaaclab_env = env
+    builtins._external_control = False  # Set True by auto_grasp_pipeline to skip env.step()
+
     # ── ROS2 bridge ──
     print("\nSetting up ROS2 bridge...")
     setup_ros2_graph(env)
@@ -251,15 +256,48 @@ def main():
     print("ROS2:   /isaac_joint_states  /cam_ext1/rgb  /cam_ext2/rgb  /cam_wrist/rgb")
     print("=" * 60 + "\n")
 
-    # ── Main loop (OmniGraph ticked via physx callback registered in setup_ros2_graph) ──
+    # ── Main loop ──
+    # Supports two modes:
+    # 1. Keyboard teleop (default)
+    # 2. External target joints (set via builtins._target_joints from MCP)
+    robot = env.scene["robot"]
+    arm_names = [f"panda_joint{i}" for i in range(1, 8)]
+    arm_idx = [i for i, n in enumerate(robot.data.joint_names) if n in arm_names]
+
     while simulation_app.is_running():
         with torch.inference_mode():
-            action = teleop.advance()
-            # Invert W/S (X axis, index 0) and A/D (Y axis, index 1)
-            action[0] = -action[0]
-            action[1] = -action[1]
-            actions = action.unsqueeze(0).repeat(env.num_envs, 1)
-            env.step(actions)
+            target = getattr(builtins, '_target_joints', None)
+
+            if target and target.get("steps_remaining", 0) > 0:
+                # External control: interpolate to target joint positions
+                total_steps = len(target.get("start_positions", [0]*7)) and target.get("steps_remaining", 1)
+                t_frac = 1.0 - (target["steps_remaining"] / max(1, total_steps + target["steps_remaining"]))
+                t_frac = min(1.0, t_frac + 0.05)
+
+                start = target["start_positions"]
+                goal = target["positions"]
+                interp = [s + t_frac * (g - s) for s, g in zip(start, goal)]
+
+                # Write directly to articulation
+                joint_pos = robot.data.joint_pos.clone()
+                joint_vel = torch.zeros_like(joint_pos)
+                for i, idx in enumerate(arm_idx):
+                    joint_pos[0, idx] = interp[i]
+                robot.write_joint_state_to_sim(joint_pos, joint_vel)
+
+                target["steps_remaining"] -= 1
+                target["start_positions"] = interp  # update start for next step
+
+                # Step env with zero action (updates physics + OmniGraph)
+                zero_act = torch.zeros(1, env.action_manager.total_action_dim, device=env.device)
+                env.step(zero_act)
+            else:
+                # Keyboard teleop mode
+                action = teleop.advance()
+                action[0] = -action[0]
+                action[1] = -action[1]
+                actions = action.unsqueeze(0).repeat(env.num_envs, 1)
+                env.step(actions)
 
             if should_reset:
                 env.reset()

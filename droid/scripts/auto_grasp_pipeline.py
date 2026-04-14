@@ -191,23 +191,15 @@ class AutoGraspPipeline(Node):
         return r.get("poses", {})
 
     # ── Robot control ──
-    def send_joint_command(self, positions, joint_names=None):
-        """Send joint position command via /isaac_joint_commands."""
-        if joint_names is None:
-            joint_names = PANDA_JOINTS
-
-        msg = JointState()
-        msg.name = joint_names
-        msg.position = [float(p) for p in positions]
-        self._joint_cmd_pub.publish(msg)
-
     def move_to_joints(self, target_positions, speed=0.5, timeout=5.0):
-        """Move robot to target joint positions smoothly."""
-        self.get_logger().info(f"Moving to joint target...")
+        """Move robot to target joint positions via MCP execute_script.
 
-        steps = int(timeout / 0.066)  # ~15Hz
+        Uses direct articulation write to bypass IsaacLab env.step() conflict.
+        """
+        self.get_logger().info(f"Moving to joint target via MCP...")
+
+        # Get current positions from ROS2
         start_positions = None
-
         with self._lock:
             if self._latest_joints:
                 names = list(self._latest_joints.name)
@@ -222,26 +214,52 @@ class AutoGraspPipeline(Node):
         if start_positions is None:
             start_positions = PANDA_HOME[:]
 
-        for step in range(steps):
-            t = min(1.0, (step + 1) / (steps * speed))
-            # Linear interpolation
-            interp = [s + t * (g - s) for s, g in zip(start_positions, target_positions)]
-            self.send_joint_command(interp)
-            self.spin_for(0.066)
+        # Send interpolated trajectory via MCP execute_script
+        target_list = [float(p) for p in target_positions]
+        start_list = [float(p) for p in start_positions]
+        steps = max(10, int(timeout * 5))
 
-        # Final command
-        self.send_joint_command(target_positions)
-        self.spin_for(0.5)
+        # Set target joints via builtins for main loop to pick up
+        code = f'''
+import builtins
+builtins._target_joints = {{
+    "positions": {target_list},
+    "joint_names": {PANDA_JOINTS},
+    "steps_remaining": {steps},
+    "start_positions": {start_list},
+}}
+print("Target joints set, will execute in main loop")
+'''
+        self.mcp.execute(code)
+        # Wait for execution (main loop will interpolate)
+        wait_time = steps * 0.15
+        self.spin_for(wait_time)
+        return True
 
     def set_gripper(self, close=False):
         """Open or close the Robotiq gripper via MCP."""
         finger_val = float(math.pi / 4) if close else 0.0
-        self.mcp._send("set_robot_joints", {
-            "joint_positions": {"finger_joint": finger_val}
-        })
-        self.spin_for(0.3)
+        state = "closed" if close else "opened"
+        code = f'''
+import builtins, torch
+env = builtins._isaaclab_env
+robot = env.scene["robot"]
+finger_idx = [i for i, n in enumerate(robot.data.joint_names) if n == "finger_joint"]
+joint_pos = robot.data.joint_pos.clone()
+for idx in finger_idx:
+    joint_pos[0, idx] = {finger_val}
+robot.write_joint_state_to_sim(joint_pos, torch.zeros_like(joint_pos))
+print("Gripper {state}")
+'''
+        self.mcp.execute(code)
+        self.spin_for(1.0)
 
     # ── Scene management ──
+    def set_external_control(self, enabled):
+        """Toggle external control mode in Isaac Sim (stops env.step() from overwriting joints)."""
+        code = f"import builtins; builtins._external_control = {enabled}; print('External control: {enabled}')"
+        self.mcp.execute(code)
+
     def randomize_and_reset(self):
         """Randomize scene and reset robot to home."""
         self.get_logger().info("Randomizing scene + resetting robot...")

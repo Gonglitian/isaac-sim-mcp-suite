@@ -35,6 +35,8 @@ from sensor_msgs.msg import JointState, Image
 from tf2_msgs.msg import TFMessage
 from cv_bridge import CvBridge
 import message_filters
+import socket
+import json as jsonlib
 
 
 class DroidDataCollector(Node):
@@ -126,6 +128,41 @@ class DroidDataCollector(Node):
                     ],
                 }
 
+    def _read_joints_via_mcp(self):
+        """Read joint state via MCP read_articulation command.
+
+        Bypasses broken OmniGraph PublishJointState in IsaacLab.
+        """
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(2)
+            s.connect(('localhost', 8766))
+            s.sendall(jsonlib.dumps({'type': 'read_articulation', 'params': {}}).encode())
+            r = jsonlib.loads(s.recv(65536).decode())
+            s.close()
+
+            result = r.get('result', r)
+            if result.get('status') != 'success':
+                return np.zeros(7), np.zeros(7), 0.0
+
+            names = result['joint_names']
+            positions = result['joint_positions']
+            velocities = result['joint_velocities']
+
+            arm_names = [f"panda_joint{i}" for i in range(1, 8)]
+            arm_idx = [names.index(n) for n in arm_names if n in names]
+            joint_pos = np.array([positions[i] for i in arm_idx]) if arm_idx else np.zeros(7)
+            joint_vel = np.array([velocities[i] for i in arm_idx]) if arm_idx else np.zeros(7)
+
+            gripper_val = 0.0
+            if "finger_joint" in names:
+                gi = names.index("finger_joint")
+                gripper_val = positions[gi] / (np.pi / 4)
+
+            return joint_pos, joint_vel, gripper_val
+        except Exception:
+            return np.zeros(7), np.zeros(7), 0.0
+
     def _cmd_cb(self, msg):
         """Remote control via /collector/cmd topic."""
         cmd = msg.data.strip().lower()
@@ -152,26 +189,33 @@ class DroidDataCollector(Node):
             wrist = self._latest_cam_wrist
             object_poses = dict(self._latest_tf)  # snapshot
 
-        if joints is None:
-            return  # no data yet
-
-        # Extract joint data
-        names = list(joints.name)
-        positions = np.array(joints.position)
-        velocities = np.array(joints.velocity) if joints.velocity else np.zeros_like(positions)
-        efforts = np.array(joints.effort) if joints.effort else np.zeros_like(positions)
-
-        # Extract arm joints (panda_joint1-7)
-        arm_names = [f"panda_joint{i}" for i in range(1, 8)]
-        arm_idx = [names.index(n) for n in arm_names if n in names]
-        joint_pos = positions[arm_idx] if arm_idx else np.zeros(7)
-        joint_vel = velocities[arm_idx] if arm_idx else np.zeros(7)
-
-        # Gripper
+        # Try ROS2 joint topic first, fallback to MCP if names are empty
+        joint_pos = np.zeros(7)
+        joint_vel = np.zeros(7)
         gripper_val = 0.0
-        if "finger_joint" in names:
-            gi = names.index("finger_joint")
-            gripper_val = positions[gi] / (np.pi / 4)  # normalize to [0,1]
+        efforts = np.zeros(7)
+
+        if joints is not None:
+            names = list(joints.name)
+            arm_names = [f"panda_joint{i}" for i in range(1, 8)]
+            arm_idx = [names.index(n) for n in arm_names if n in names]
+
+            if arm_idx:
+                # ROS2 topic has valid joint names
+                positions = np.array(joints.position)
+                velocities = np.array(joints.velocity) if joints.velocity else np.zeros_like(positions)
+                joint_pos = positions[arm_idx]
+                joint_vel = velocities[arm_idx]
+                if "finger_joint" in names:
+                    gi = names.index("finger_joint")
+                    gripper_val = positions[gi] / (np.pi / 4)
+            else:
+                # Fallback: read from MCP (OmniGraph PublishJointState broken in IsaacLab)
+                joint_pos, joint_vel, gripper_val = self._read_joints_via_mcp()
+
+        else:
+            # No ROS2 data at all, try MCP
+            joint_pos, joint_vel, gripper_val = self._read_joints_via_mcp()
 
         # Images
         img_ext1 = self._decode_image(ext1)

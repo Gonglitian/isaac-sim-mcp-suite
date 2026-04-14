@@ -306,6 +306,7 @@ class MCPExtension(omni.ext.IExt):
             "save_scene": self.save_scene,
             "load_scene": self.load_scene,
             "set_robot_joints": self.set_robot_joints,
+            "read_articulation": self.read_articulation,
         }
         
         handler = handlers.get(cmd_type)
@@ -1186,6 +1187,30 @@ class MCPExtension(omni.ext.IExt):
 
             return {"status": "success", "set_joints": set_joints,
                     "message": f"Set {len(set_joints)} joints"}
+        except Exception as e:
+            traceback.print_exc()
+            return {"status": "error", "message": str(e)}
+
+    def read_articulation(self, robot_name: str = "robot"):
+        """Read articulation joint state from IsaacLab env (if available)."""
+        try:
+            import builtins
+            env = getattr(builtins, '_isaaclab_env', None)
+            if env is None:
+                return {"status": "error", "message": "No IsaacLab env in builtins"}
+
+            robot = env.scene[robot_name]
+            jp = robot.data.joint_pos[0].cpu().tolist()
+            jv = robot.data.joint_vel[0].cpu().tolist()
+            names = list(robot.data.joint_names)
+
+            return {
+                "status": "success",
+                "joint_names": names,
+                "joint_positions": jp,
+                "joint_velocities": jv,
+                "num_joints": len(names),
+            }
         except Exception as e:
             traceback.print_exc()
             return {"status": "error", "message": str(e)}
