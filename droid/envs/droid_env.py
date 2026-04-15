@@ -71,7 +71,7 @@ class DroidSceneCfg(InteractiveSceneCfg):
         prim_path="{ENV_REGEX_NS}/external_cam_1",
         height=720,
         width=1280,
-        data_types=["rgb"],
+        data_types=["rgb", "depth"],
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=2.1, focus_distance=28.0,
             horizontal_aperture=5.376, vertical_aperture=3.024,
