@@ -171,14 +171,6 @@ def get_object_world_pose(env, object_prim_path):
     return mat.astype(np.float64)
 
 
-def get_target_object_path(env, scene_id):
-    """Get the prim path of the target object based on scene."""
-    scene_objects = {
-        "1": "/World/envs/env_0/scene/rubiks_cube",
-        "2": "/World/envs/env_0/scene/can",
-        "3": "/World/envs/env_0/scene/banana",
-    }
-    return scene_objects.get(scene_id, "/World/envs/env_0/scene/rubiks_cube")
 
 
 def depth_to_pointcloud(depth_tensor, cam_cfg):
@@ -372,7 +364,7 @@ def main():
             print(f"GraspGen unavailable: {e}")
 
     recorder = EpisodeRecorder()
-    target_obj_path = get_target_object_path(env, args.scene_id)
+
 
     # Warm up
     env.reset()
@@ -382,10 +374,19 @@ def main():
         except RuntimeError:
             env.sim.render()
 
+    # Scene object paths
+    scene_objects = {
+        "1": {"pick": "/World/envs/env_0/scene/rubiks_cube", "place": "/World/envs/env_0/scene/_24_bowl"},
+        "2": {"pick": "/World/envs/env_0/scene/can", "place": "/World/envs/env_0/scene/mug"},
+        "3": {"pick": "/World/envs/env_0/scene/banana", "place": "/World/envs/env_0/scene/bin"},
+    }
+    pick_path = scene_objects.get(args.scene_id, scene_objects["1"])["pick"]
+    place_path = scene_objects.get(args.scene_id, scene_objects["1"])["place"]
+
     print(f"\n{'='*60}")
     print(f"Auto Grasp Collection")
     print(f"  Task: {args.task} | Episodes: {args.num_episodes}")
-    print(f"  Target object: {target_obj_path}")
+    print(f"  Pick: {pick_path.split('/')[-1]} | Place: {place_path.split('/')[-1]}")
     print(f"  GraspGen: {'connected' if grasp_client else 'heuristic'}")
     print(f"{'='*60}\n")
 
@@ -407,24 +408,35 @@ def main():
         env.reset()
         recorder.reset()
 
-        # 1. Move to home
+        # 1. Move to home + wait for physics to settle (objects fall to table)
         move_to(HOME, steps=15)
+        print("  [1] Settling physics...")
+        zero = build_action(env, HOME)
+        for _ in range(60):
+            env.step(zero)
 
-        # 2. Get object world pose
-        obj_pose_mat = get_object_world_pose(env, target_obj_path)
-        if obj_pose_mat is not None:
-            obj_pos = obj_pose_mat[:3, 3]
-            print(f"  [2] Object at world pos: [{obj_pos[0]:.3f}, {obj_pos[1]:.3f}, {obj_pos[2]:.3f}]")
+        # 2. Read object positions AFTER settling
+        pick_pose = get_object_world_pose(env, pick_path)
+        place_pose = get_object_world_pose(env, place_path)
+
+        if pick_pose is not None:
+            obj_pos = pick_pose[:3, 3].copy()
         else:
             obj_pos = np.array([0.3, 0.0, 0.5])
-            print(f"  [2] Object not found, using default pos")
+        print(f"  [2] Pick ({pick_path.split('/')[-1]}): [{obj_pos[0]:.3f}, {obj_pos[1]:.3f}, {obj_pos[2]:.3f}]")
+
+        if place_pose is not None:
+            bowl_pos = place_pose[:3, 3].copy()
+        else:
+            bowl_pos = obj_pos + np.array([0.15, 0.15, 0.0])
+        print(f"  [2] Place ({place_path.split('/')[-1]}): [{bowl_pos[0]:.3f}, {bowl_pos[1]:.3f}, {bowl_pos[2]:.3f}]")
 
         # 3. Get object point cloud from mesh (ground truth, no camera noise)
         pc = None
         try:
             import trimesh as tm
             stage = omni.usd.get_context().get_stage()
-            obj_prim = stage.GetPrimAtPath(target_obj_path)
+            obj_prim = stage.GetPrimAtPath(pick_path)
             if obj_prim.IsValid():
                 # Find mesh geometry under the object prim
                 mesh_found = False
@@ -461,7 +473,7 @@ def main():
                 # Update obj_pos to use bbox center (more accurate)
                 obj_pos = obj_center
             else:
-                print(f"  [3] Object prim not found: {target_obj_path}")
+                print(f"  [3] Object prim not found: {pick_path}")
         except Exception as e:
             print(f"  [3] Mesh PC error: {e}")
             import traceback; traceback.print_exc()
@@ -527,12 +539,12 @@ def main():
         EE_TO_FINGERTIP = 0.20
 
         pre_grasp_pos = grasp_world_pos.copy()
-        pre_grasp_pos[2] += 0.10  # 10cm above grasp (wrist already at correct height)
+        pre_grasp_pos[2] += 0.10  # 10cm above grasp
 
-        place_pos = obj_pos.copy()
-        place_pos[0] += 0.15
-        place_pos[1] += 0.15
-        place_pos[2] += EE_TO_FINGERTIP  # wrist above place location
+        # Place: wrist above bowl position
+        place_pos = bowl_pos.copy()
+        place_pos[2] += EE_TO_FINGERTIP  # wrist above bowl
+        print(f"       Place wrist target: [{place_pos[0]:.3f}, {place_pos[1]:.3f}, {place_pos[2]:.3f}]")
 
         # All phases recorded every step (smooth video)
         print("       Phase 1: Pre-grasp")
