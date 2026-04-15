@@ -436,13 +436,28 @@ def main():
                     # is relative to the point cloud centroid. Since the object IS the
                     # point cloud, grasp_pos ≈ offset from object center.
                     # World grasp = object_world_pos + grasp_offset
-                    grasp_offset = grasp_obj[:3, 3]  # offset from object center
-                    grasp_world_pos = obj_pos + grasp_offset
-                    # Ensure Z is above the table (at least object height)
-                    grasp_world_pos[2] = max(grasp_world_pos[2], obj_pos[2])
+                    grasp_offset = grasp_obj[:3, 3]  # offset from object center (in centered PC frame)
+
+                    # GraspGen gives the gripper TCP position. For Robotiq 2F-140,
+                    # the TCP is between the fingertips. But our IK targets panda_link8
+                    # (wrist), which is ~0.20m above the fingertips.
+                    # So we only need the XY from grasp offset, and set Z for the wrist:
+                    # wrist_Z = object_top + gripper_offset (to position fingertips at object)
+                    EE_TO_FINGERTIP = 0.20  # panda_link8 → Robotiq fingertip offset
+
+                    # World grasp position for fingertips (XY from GraspGen, Z at object top)
+                    fingertip_world = obj_pos.copy()
+                    fingertip_world[0] += grasp_offset[0]  # XY offset from GraspGen
+                    fingertip_world[1] += grasp_offset[1]
+
+                    # Wrist (panda_link8) needs to be above fingertip target
+                    grasp_world_pos = fingertip_world.copy()
+                    grasp_world_pos[2] = obj_pos[2] + EE_TO_FINGERTIP  # wrist above object
+
                     print(f"  [4] GraspGen: {len(grasps)} grasps, best={confs[0]:.3f}")
                     print(f"       Grasp offset: [{grasp_offset[0]:.3f}, {grasp_offset[1]:.3f}, {grasp_offset[2]:.3f}]")
-                    print(f"       World grasp pos: [{grasp_world_pos[0]:.3f}, {grasp_world_pos[1]:.3f}, {grasp_world_pos[2]:.3f}]")
+                    print(f"       Fingertip target: [{fingertip_world[0]:.3f}, {fingertip_world[1]:.3f}, {fingertip_world[2]:.3f}]")
+                    print(f"       Wrist (EE) target: [{grasp_world_pos[0]:.3f}, {grasp_world_pos[1]:.3f}, {grasp_world_pos[2]:.3f}]")
 
                     # Save point cloud + grasps for visualization
                     if args.visualize:
@@ -457,21 +472,24 @@ def main():
                 print(f"  [4] GraspGen error: {e}")
 
         if grasp_world_pos is None:
-            # Heuristic: grasp above the object
+            # Heuristic: wrist above the object (fingertips at object height)
+            EE_TO_FINGERTIP = 0.20
             grasp_world_pos = obj_pos.copy()
-            grasp_world_pos[2] += 0.1  # slightly above
-            print(f"  [4] Heuristic grasp at [{grasp_world_pos[0]:.3f}, {grasp_world_pos[1]:.3f}, {grasp_world_pos[2]:.3f}]")
+            grasp_world_pos[2] += EE_TO_FINGERTIP
+            print(f"  [4] Heuristic wrist target: [{grasp_world_pos[0]:.3f}, {grasp_world_pos[1]:.3f}, {grasp_world_pos[2]:.3f}]")
 
         # 5+6. Move EE to grasp targets using Jacobian IK + record every step
         print("  [5] Executing pick-and-place with IK...")
 
+        EE_TO_FINGERTIP = 0.20
+
         pre_grasp_pos = grasp_world_pos.copy()
-        pre_grasp_pos[2] += 0.15
+        pre_grasp_pos[2] += 0.10  # 10cm above grasp (wrist already at correct height)
 
         place_pos = obj_pos.copy()
         place_pos[0] += 0.15
         place_pos[1] += 0.15
-        place_pos[2] += 0.15
+        place_pos[2] += EE_TO_FINGERTIP  # wrist above place location
 
         # Phase 1: Pre-grasp (above object)
         print("       Phase 1: Pre-grasp")
