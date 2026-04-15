@@ -303,7 +303,50 @@ def move_ee_to_pos(env, robot, arm_idx, target_pos, steps=40, grip_close=False):
         env.step(action)
 
     final_error = (target_pos_t - robot.data.body_pos_w[0, ee_body_idx, :3]).norm().item()
-    print(f"       EE final error: {final_error:.4f}m after {min(step+1, steps)} steps")
+    print(f"       EE error: {final_error:.4f}m ({min(step+1, steps)} steps)")
+    return get_arm_pos(robot, arm_idx)
+
+
+def move_ee_to_pos_recorded(env, robot, arm_idx, finger_idx, target_pos, recorder,
+                            steps=40, grip_close=False):
+    """Same as move_ee_to_pos but records every step."""
+    ee_body_idx = None
+    for i, name in enumerate(robot.data.body_names):
+        if name == "panda_link8":
+            ee_body_idx = i
+            break
+    if ee_body_idx is None:
+        ee_body_idx = len(robot.data.body_names) - 1
+
+    target_pos_t = torch.tensor(target_pos, dtype=torch.float32, device=env.device)
+
+    for step in range(steps):
+        ee_pos = robot.data.body_pos_w[0, ee_body_idx, :3]
+        error = target_pos_t - ee_pos
+        if error.norm().item() < 0.005:
+            break
+
+        jacobian_full = robot.root_physx_view.get_jacobians()
+        jacobian = jacobian_full[0, ee_body_idx, :3, :7]
+        lam = 0.05
+        JT = jacobian.T
+        JJT = jacobian @ JT + lam * torch.eye(3, device=env.device)
+        delta_q = JT @ torch.linalg.solve(JJT, error)
+        if delta_q.norm() > 0.1:
+            delta_q = delta_q * 0.1 / delta_q.norm()
+
+        current_jp = robot.data.joint_pos[0, arm_idx].cpu().tolist()
+        new_jp = [current_jp[i] + delta_q[i].item() for i in range(7)]
+        limits = [(-2.9, 2.9), (-1.8, 1.8), (-2.9, 2.9), (-3.1, 0.08),
+                  (-2.9, 2.9), (-0.08, 3.8), (-2.9, 2.9)]
+        new_jp = [max(limits[i][0], min(limits[i][1], new_jp[i])) for i in range(7)]
+
+        action = build_action(env, new_jp, grip_close)
+        env.step(action)
+        recorder.record(robot, arm_idx, finger_idx, env, new_jp, 1.0 if grip_close else 0.0)
+
+    final_error = (target_pos_t - robot.data.body_pos_w[0, ee_body_idx, :3]).norm().item()
+    print(f"       EE error: {final_error:.4f}m ({min(step+1, steps)} steps)")
     return get_arm_pos(robot, arm_idx)
 
 
@@ -491,50 +534,31 @@ def main():
         place_pos[1] += 0.15
         place_pos[2] += EE_TO_FINGERTIP  # wrist above place location
 
-        # Phase 1: Pre-grasp (above object)
+        # All phases recorded every step (smooth video)
         print("       Phase 1: Pre-grasp")
-        move_ee_to_pos(env, robot, arm_idx, pre_grasp_pos, steps=40)
-        # Record these steps
-        for _ in range(5):
-            jp = get_arm_pos(robot, arm_idx)
-            step_and_record(jp)
+        move_ee_to_pos_recorded(env, robot, arm_idx, finger_idx, pre_grasp_pos, recorder, steps=40)
 
-        # Phase 2: Approach (down to grasp)
         print("       Phase 2: Approach")
-        move_ee_to_pos(env, robot, arm_idx, grasp_world_pos, steps=30)
-        for _ in range(5):
-            jp = get_arm_pos(robot, arm_idx)
-            step_and_record(jp)
+        move_ee_to_pos_recorded(env, robot, arm_idx, finger_idx, grasp_world_pos, recorder, steps=30)
 
-        # Phase 3: Close gripper
         print("       Phase 3: Grasp")
         jp = get_arm_pos(robot, arm_idx)
-        for _ in range(15):
+        for _ in range(20):
             step_and_record(jp, grip_close=True)
 
-        # Phase 4: Lift
         print("       Phase 4: Lift")
-        move_ee_to_pos(env, robot, arm_idx, pre_grasp_pos, steps=30, grip_close=True)
-        for _ in range(5):
-            jp = get_arm_pos(robot, arm_idx)
-            step_and_record(jp, grip_close=True)
+        move_ee_to_pos_recorded(env, robot, arm_idx, finger_idx, pre_grasp_pos, recorder, steps=30, grip_close=True)
 
-        # Phase 5: Move to place
         print("       Phase 5: Place")
-        move_ee_to_pos(env, robot, arm_idx, place_pos, steps=30, grip_close=True)
-        for _ in range(5):
-            jp = get_arm_pos(robot, arm_idx)
-            step_and_record(jp, grip_close=True)
+        move_ee_to_pos_recorded(env, robot, arm_idx, finger_idx, place_pos, recorder, steps=30, grip_close=True)
 
-        # Phase 6: Release
         print("       Phase 6: Release")
         jp = get_arm_pos(robot, arm_idx)
-        for _ in range(15):
+        for _ in range(20):
             step_and_record(jp, grip_close=False)
 
-        # Phase 7: Retract to home
         print("       Phase 7: Home")
-        move_to(HOME, steps=15)
+        move_to(HOME, steps=20)
 
         # 7. Save
         h5 = recorder.save(args.output_dir, episode_id, args.task, args.scene_id)
