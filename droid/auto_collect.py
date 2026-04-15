@@ -246,51 +246,65 @@ def lerp_joints(start, end, steps):
 
 # ── IK Solver ──
 
-def solve_ik_to_pose(env, robot, arm_idx, target_pos, target_quat=None, num_iters=50):
-    """Use IsaacLab's DifferentialIKController to solve for target EE pose.
+def move_ee_to_pos(env, robot, arm_idx, target_pos, steps=40, grip_close=False):
+    """Move EE to target world position using DifferentialIK action space.
 
-    Args:
-        target_pos: (3,) world position
-        target_quat: (4,) quaternion (w,x,y,z). If None, use downward-facing.
-    Returns:
-        target_joints: list of 7 joint angles, or None if failed.
+    Instead of solving IK manually, we switch the env action to DifferentialIK
+    and feed SE(3) deltas directly. IsaacLab handles the IK internally.
+
+    With JointPositionActionCfg env, we can't use this directly.
+    So we use iterative position control: read current EE, compute error,
+    apply small joint corrections via env.step().
     """
-    if target_quat is None:
-        # Downward-facing gripper
-        target_quat = np.array([0.0, 1.0, 0.0, 0.0])  # w,x,y,z
+    ee_body_idx = None
+    for i, name in enumerate(robot.data.body_names):
+        if name == "panda_link8":
+            ee_body_idx = i
+            break
+    if ee_body_idx is None:
+        ee_body_idx = len(robot.data.body_names) - 1
 
-    # Get current state
-    current_joints = robot.data.joint_pos[0, arm_idx].cpu()
-    ee_pos = robot.data.body_pos_w[0, -1, :3].cpu()
-    ee_quat = robot.data.body_quat_w[0, -1].cpu()  # w,x,y,z
+    target_pos_t = torch.tensor(target_pos, dtype=torch.float32, device=env.device)
 
-    # Compute delta in position
-    delta_pos = torch.tensor(target_pos, dtype=torch.float32) - ee_pos
+    for step in range(steps):
+        ee_pos = robot.data.body_pos_w[0, ee_body_idx, :3]
+        error = target_pos_t - ee_pos
+        error_norm = error.norm().item()
 
-    # Clamp delta to avoid huge jumps
-    max_delta = 0.3
-    delta_norm = delta_pos.norm()
-    if delta_norm > max_delta:
-        delta_pos = delta_pos * max_delta / delta_norm
+        if error_norm < 0.005:
+            print(f"       EE reached target: error={error_norm:.4f}m at step {step}")
+            break
 
-    # Simple approach: just offset the current joints proportionally
-    # This is a heuristic — a proper IK would use the Jacobian
-    # For now, map XYZ delta to joint adjustments
-    target_joints = list(current_joints.numpy())
+        # Compute joint correction using Jacobian from PhysX
+        jacobian_full = robot.root_physx_view.get_jacobians()  # (N, num_bodies, 6, num_dofs)
+        jacobian = jacobian_full[0, ee_body_idx, :3, :7]  # (3, 7) position-only
 
-    # Rough mapping: joint1=yaw, joint2=pitch, joint4=elbow, joint6=wrist
-    target_joints[0] += float(delta_pos[1]) * 2.0   # Y → joint1 (base rotation)
-    target_joints[1] += float(-delta_pos[2]) * 1.5   # Z → joint2 (shoulder)
-    target_joints[3] += float(delta_pos[2]) * 1.0    # Z → joint4 (elbow)
-    target_joints[5] += float(-delta_pos[0]) * 0.5   # X → joint6 (wrist)
+        # Damped least squares
+        lam = 0.05
+        JT = jacobian.T
+        JJT = jacobian @ JT + lam * torch.eye(3, device=env.device)
+        delta_q = JT @ torch.linalg.solve(JJT, error)
 
-    # Clamp to joint limits
-    limits = [(-2.9, 2.9), (-1.8, 1.8), (-2.9, 2.9), (-3.1, 0.08),
-              (-2.9, 2.9), (-0.08, 3.8), (-2.9, 2.9)]
-    for i in range(7):
-        target_joints[i] = max(limits[i][0], min(limits[i][1], target_joints[i]))
+        # Scale step
+        max_step = 0.1
+        if delta_q.norm() > max_step:
+            delta_q = delta_q * max_step / delta_q.norm()
 
-    return target_joints
+        # Apply as joint position target
+        current_jp = robot.data.joint_pos[0, arm_idx].cpu().tolist()
+        new_jp = [current_jp[i] + delta_q[i].item() for i in range(7)]
+
+        # Clamp
+        limits = [(-2.9, 2.9), (-1.8, 1.8), (-2.9, 2.9), (-3.1, 0.08),
+                  (-2.9, 2.9), (-0.08, 3.8), (-2.9, 2.9)]
+        new_jp = [max(limits[i][0], min(limits[i][1], new_jp[i])) for i in range(7)]
+
+        action = build_action(env, new_jp, grip_close)
+        env.step(action)
+
+    final_error = (target_pos_t - robot.data.body_pos_w[0, ee_body_idx, :3]).norm().item()
+    print(f"       EE final error: {final_error:.4f}m after {min(step+1, steps)} steps")
+    return get_arm_pos(robot, arm_idx)
 
 
 # ── Main ──
@@ -362,24 +376,52 @@ def main():
             obj_pos = np.array([0.3, 0.0, 0.5])
             print(f"  [2] Object not found, using default pos")
 
-        # 3. Get depth point cloud from external_cam_1
+        # 3. Get object point cloud from mesh (ground truth, no camera noise)
         pc = None
         try:
-            ext_cam = env.scene["external_cam_1"]
-            depth_data = ext_cam.data.output.get("depth")
-            if depth_data is not None:
-                raw_pc = depth_to_pointcloud(depth_data[0], ext_cam.cfg)
-                if len(raw_pc) > 50:
-                    # Segment: keep points near the object
-                    # Note: point cloud is in camera frame, object pos is in world frame
-                    # For now, just use all points (segmentation needs camera extrinsics)
-                    pc = raw_pc
-                    if len(pc) > 2000:
-                        pc = pc[np.random.choice(len(pc), 2000, replace=False)]
-                    pc -= pc.mean(axis=0)  # center for GraspGen
-                    print(f"  [3] Point cloud: {pc.shape[0]} pts from depth")
+            import trimesh as tm
+            stage = omni.usd.get_context().get_stage()
+            obj_prim = stage.GetPrimAtPath(target_obj_path)
+            if obj_prim.IsValid():
+                # Find mesh geometry under the object prim
+                mesh_found = False
+                for child in obj_prim.GetAllChildren() if hasattr(obj_prim, 'GetAllChildren') else []:
+                    pass
+                # Use trimesh with the USD file directly or sample from bbox
+                # Simple approach: create a box point cloud based on object bounding box
+                from pxr import UsdGeom
+                bbox_cache = UsdGeom.BBoxCache(0, [UsdGeom.Tokens.default_])
+                bbox = bbox_cache.ComputeWorldBound(obj_prim)
+                bbox_range = bbox.ComputeAlignedRange()
+                bbox_min = np.array(bbox_range.GetMin())
+                bbox_max = np.array(bbox_range.GetMax())
+                obj_size = bbox_max - bbox_min
+                obj_center = (bbox_min + bbox_max) / 2.0
+
+                # Sample points on the surface of the bounding box (6 faces)
+                n_per_face = 350
+                faces_pts = []
+                for axis in range(3):
+                    for side in [bbox_min[axis], bbox_max[axis]]:
+                        pts = np.random.uniform(bbox_min, bbox_max, (n_per_face, 3)).astype(np.float32)
+                        pts[:, axis] = side
+                        faces_pts.append(pts)
+                pc = np.concatenate(faces_pts, axis=0)
+                # Add some interior points for density
+                interior = np.random.uniform(bbox_min, bbox_max, (200, 3)).astype(np.float32)
+                pc = np.concatenate([pc, interior], axis=0)
+                # Center for GraspGen
+                pc -= pc.mean(axis=0)
+                print(f"  [3] Point cloud: {pc.shape[0]} pts from mesh bbox")
+                print(f"       Object bbox: size=[{obj_size[0]:.3f}, {obj_size[1]:.3f}, {obj_size[2]:.3f}]")
+                print(f"       Object center: [{obj_center[0]:.3f}, {obj_center[1]:.3f}, {obj_center[2]:.3f}]")
+                # Update obj_pos to use bbox center (more accurate)
+                obj_pos = obj_center
+            else:
+                print(f"  [3] Object prim not found: {target_obj_path}")
         except Exception as e:
-            print(f"  [3] Depth error: {e}")
+            print(f"  [3] Mesh PC error: {e}")
+            import traceback; traceback.print_exc()
 
         # 4. GraspGen or heuristic
         grasp_world_pos = None
@@ -389,35 +431,28 @@ def main():
             try:
                 grasps, confs = grasp_client.infer(pc, num_grasps=200, topk_num_grasps=50)
                 if len(grasps) > 0:
-                    grasp_obj = grasps[0]  # (4,4) SE(3) in point cloud (≈object) frame
-                    # Transform to world frame: world_grasp = obj_world_pose × grasp_obj
-                    if obj_pose_mat is not None:
-                        grasp_world_mat = obj_pose_mat @ grasp_obj
-                    else:
-                        grasp_world_mat = grasp_obj
-                    grasp_world_pos = grasp_world_mat[:3, 3]
+                    grasp_obj = grasps[0]  # (4,4) SE(3) relative to centered point cloud
+                    # The point cloud was centered (mean subtracted), so grasp position
+                    # is relative to the point cloud centroid. Since the object IS the
+                    # point cloud, grasp_pos ≈ offset from object center.
+                    # World grasp = object_world_pos + grasp_offset
+                    grasp_offset = grasp_obj[:3, 3]  # offset from object center
+                    grasp_world_pos = obj_pos + grasp_offset
+                    # Ensure Z is above the table (at least object height)
+                    grasp_world_pos[2] = max(grasp_world_pos[2], obj_pos[2])
                     print(f"  [4] GraspGen: {len(grasps)} grasps, best={confs[0]:.3f}")
+                    print(f"       Grasp offset: [{grasp_offset[0]:.3f}, {grasp_offset[1]:.3f}, {grasp_offset[2]:.3f}]")
                     print(f"       World grasp pos: [{grasp_world_pos[0]:.3f}, {grasp_world_pos[1]:.3f}, {grasp_world_pos[2]:.3f}]")
 
-                    # Optional visualization
+                    # Save point cloud + grasps for visualization
                     if args.visualize:
-                        try:
-                            from grasp_gen.utils.viser_utils import (
-                                create_visualizer, get_color_from_score,
-                                visualize_grasp, visualize_pointcloud,
-                            )
-                            vis = create_visualizer(port=8080)
-                            pc_color = np.ones((len(pc), 3), dtype=np.uint8) * 200
-                            visualize_pointcloud(vis, "point_cloud", pc, pc_color, size=0.003)
-                            scores = get_color_from_score(confs[:20], use_255_scale=True)
-                            for i in range(min(20, len(grasps))):
-                                g = grasps[i].copy()
-                                g[3, 3] = 1.0
-                                visualize_grasp(vis, f"grasps/{i:03d}", g, color=scores[i],
-                                                gripper_name="robotiq_2f_140", linewidth=0.6)
-                            print(f"       Viser: http://localhost:8080")
-                        except Exception as e:
-                            print(f"       Viser error: {e}")
+                        vis_dir = Path(args.output_dir) / f"episode_{episode_id:04d}"
+                        vis_dir.mkdir(parents=True, exist_ok=True)
+                        np.save(vis_dir / "point_cloud.npy", pc)
+                        np.save(vis_dir / "grasps.npy", grasps[:20])
+                        np.save(vis_dir / "confidences.npy", confs[:20])
+                        print(f"       Saved PC + grasps for visualization")
+                        print(f"       Visualize: conda activate graspgen && python libs/GraspGen/client-server/graspgen_client.py --pcd_file {vis_dir}/point_cloud.npy --host localhost --port 5556 --visualize")
             except Exception as e:
                 print(f"  [4] GraspGen error: {e}")
 
@@ -427,51 +462,60 @@ def main():
             grasp_world_pos[2] += 0.1  # slightly above
             print(f"  [4] Heuristic grasp at [{grasp_world_pos[0]:.3f}, {grasp_world_pos[1]:.3f}, {grasp_world_pos[2]:.3f}]")
 
-        # 5. IK solve: grasp world position → target joints
-        print("  [5] IK solving...")
+        # 5+6. Move EE to grasp targets using Jacobian IK + record every step
+        print("  [5] Executing pick-and-place with IK...")
 
-        # Pre-grasp: above the grasp point
         pre_grasp_pos = grasp_world_pos.copy()
-        pre_grasp_pos[2] += 0.15  # 15cm above
-        pre_grasp_joints = solve_ik_to_pose(env, robot, arm_idx, pre_grasp_pos)
+        pre_grasp_pos[2] += 0.15
 
-        # Grasp position
-        grasp_joints = solve_ik_to_pose(env, robot, arm_idx, grasp_world_pos)
-
-        # Place position (offset from object)
         place_pos = obj_pos.copy()
-        place_pos[0] += 0.2
-        place_pos[1] += 0.2
+        place_pos[0] += 0.15
+        place_pos[1] += 0.15
         place_pos[2] += 0.15
-        place_joints = solve_ik_to_pose(env, robot, arm_idx, place_pos)
-
-        print(f"       Pre-grasp joints: [{', '.join(f'{j:.2f}' for j in pre_grasp_joints[:3])}...]")
-        print(f"       Grasp joints:     [{', '.join(f'{j:.2f}' for j in grasp_joints[:3])}...]")
-
-        # 6. Execute pick-and-place (record every step)
-        print("  [6] Executing pick-and-place...")
 
         # Phase 1: Pre-grasp (above object)
-        move_to(pre_grasp_joints, steps=30)
+        print("       Phase 1: Pre-grasp")
+        move_ee_to_pos(env, robot, arm_idx, pre_grasp_pos, steps=40)
+        # Record these steps
+        for _ in range(5):
+            jp = get_arm_pos(robot, arm_idx)
+            step_and_record(jp)
 
-        # Phase 2: Approach (move down to grasp)
-        move_to(grasp_joints, steps=20)
+        # Phase 2: Approach (down to grasp)
+        print("       Phase 2: Approach")
+        move_ee_to_pos(env, robot, arm_idx, grasp_world_pos, steps=30)
+        for _ in range(5):
+            jp = get_arm_pos(robot, arm_idx)
+            step_and_record(jp)
 
         # Phase 3: Close gripper
+        print("       Phase 3: Grasp")
+        jp = get_arm_pos(robot, arm_idx)
         for _ in range(15):
-            step_and_record(grasp_joints, grip_close=True)
+            step_and_record(jp, grip_close=True)
 
-        # Phase 4: Lift (back to pre-grasp height)
-        move_to(pre_grasp_joints, steps=20, grip_close=True)
+        # Phase 4: Lift
+        print("       Phase 4: Lift")
+        move_ee_to_pos(env, robot, arm_idx, pre_grasp_pos, steps=30, grip_close=True)
+        for _ in range(5):
+            jp = get_arm_pos(robot, arm_idx)
+            step_and_record(jp, grip_close=True)
 
         # Phase 5: Move to place
-        move_to(place_joints, steps=25, grip_close=True)
+        print("       Phase 5: Place")
+        move_ee_to_pos(env, robot, arm_idx, place_pos, steps=30, grip_close=True)
+        for _ in range(5):
+            jp = get_arm_pos(robot, arm_idx)
+            step_and_record(jp, grip_close=True)
 
         # Phase 6: Release
+        print("       Phase 6: Release")
+        jp = get_arm_pos(robot, arm_idx)
         for _ in range(15):
-            step_and_record(place_joints, grip_close=False)
+            step_and_record(jp, grip_close=False)
 
         # Phase 7: Retract to home
+        print("       Phase 7: Home")
         move_to(HOME, steps=15)
 
         # 7. Save
